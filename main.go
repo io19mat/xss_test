@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,12 +12,36 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/chromedp/chromedp"
 )
+
+func fetchRenderedHTML(target string, timeout time.Duration, wait time.Duration) (string, error) {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	ctx, timeoutCancel := context.WithTimeout(ctx, timeout)
+	defer timeoutCancel()
+
+	var html string
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(target),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+		chromedp.Sleep(wait),
+		chromedp.OuterHTML("html", &html, chromedp.ByQuery),
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return html, nil
+}
 
 func main() {
 	// Parse CLI arguments
 	target := flag.String("url", "", "Target URL to scan")
 	timeout := flag.Int("timeout", 10, "Request timeout in seconds")
+	renderJS := flag.Bool("js", false, "Render JavaScript with headless browser before form scanning")
+	renderWaitMs := flag.Int("js-wait", 1500, "Wait time in milliseconds after page load when -js is enabled")
 	testServer := flag.Bool("testserver", false, "Start a local vulnerable test server")
 	flag.Parse()
 
@@ -90,7 +115,20 @@ func main() {
 
 	// Form-based XSS check
 	fmt.Println("\nScanning forms for XSS...")
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
+	htmlForFormScan := string(body)
+	if *renderJS {
+		waitDuration := time.Duration(*renderWaitMs) * time.Millisecond
+		fmt.Printf("JavaScript rendering enabled; loading page in headless browser (wait=%s)...\n", waitDuration)
+		renderedHTML, renderErr := fetchRenderedHTML(*target, time.Duration(*timeout)*time.Second, waitDuration)
+		if renderErr != nil {
+			fmt.Printf("Warning: could not render JavaScript page (%v). Falling back to raw HTML response.\n", renderErr)
+		} else {
+			htmlForFormScan = renderedHTML
+			fmt.Printf("Rendered DOM length: %d\n", len(htmlForFormScan))
+		}
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlForFormScan))
 	if err != nil {
 		fmt.Printf("Error parsing HTML for forms: %v\n", err)
 		return

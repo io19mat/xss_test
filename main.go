@@ -9,21 +9,24 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/chromedp"
 )
 
-func fetchRenderedHTML(target string, timeout time.Duration, wait time.Duration) (string, error) {
-	ctx, cancel := chromedp.NewContext(context.Background())
-	defer cancel()
+func fetchRenderedHTML(parentCtx context.Context, target string, timeout time.Duration, wait time.Duration) (string, error) {
+	// create a chromedp context that derives from the parent context so
+	// cancellation propagates. Also apply an internal timeout for chromedp.Run.
+	ctx, cancelCtx := chromedp.NewContext(parentCtx)
+	defer cancelCtx()
 
-	ctx, timeoutCancel := context.WithTimeout(ctx, timeout)
+	runCtx, timeoutCancel := context.WithTimeout(ctx, timeout)
 	defer timeoutCancel()
 
 	var html string
-	err := chromedp.Run(ctx,
+	err := chromedp.Run(runCtx,
 		chromedp.Navigate(target),
 		chromedp.WaitReady("body", chromedp.ByQuery),
 		chromedp.Sleep(wait),
@@ -38,10 +41,13 @@ func fetchRenderedHTML(target string, timeout time.Duration, wait time.Duration)
 
 func main() {
 	// Parse CLI arguments
-	target := flag.String("url", "", "Target URL to scan")
+	// `-url` accepts a single URL or a comma-separated list of URLs
+	target := flag.String("url", "", "Target URL or comma-separated URLs to scan")
 	timeout := flag.Int("timeout", 10, "Request timeout in seconds")
 	renderJS := flag.Bool("js", false, "Render JavaScript with headless browser before form scanning")
 	renderWaitMs := flag.Int("js-wait", 1500, "Wait time in milliseconds after page load when -js is enabled")
+	workers := flag.Int("concurrency", 5, "Max concurrent scans (and chrome instances)")
+	scanTimeout := flag.Int("scan-timeout", 30, "Per-target scan timeout in seconds")
 	testServer := flag.Bool("testserver", false, "Start a local vulnerable test server")
 	flag.Parse()
 
@@ -52,7 +58,7 @@ func main() {
 	}
 
 	if *target == "" {
-		fmt.Println("Usage: go run main.go -url=https://example.com")
+		fmt.Println("Usage: go run main.go -url=https://example.com,https://example.org")
 		fmt.Println("Or: go run . -testserver")
 		os.Exit(1)
 	}
@@ -62,76 +68,130 @@ func main() {
 		Timeout: time.Duration(*timeout) * time.Second,
 	}
 
-	fmt.Printf("Scanning target: %s\n", *target)
+	// Support multiple comma-separated targets
+	targets := []string{}
+	for _, t := range strings.Split(*target, ",") {
+		tt := strings.TrimSpace(t)
+		if tt != "" {
+			targets = append(targets, tt)
+		}
+	}
 
-	// Example: Make a GET request to the target
-	resp, err := client.Get(*target)
+	// Channel to collect results from workers
+	results := make(chan string, len(targets))
+
+	// jobs channel and worker pool
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+
+	xssPayload := "<script>alert('xss')</script>"
+
+	// start worker goroutines
+	for i := 0; i < *workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for u := range jobs {
+				// per-target context enforcing scan timeout
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*scanTimeout)*time.Second)
+				res := scanTarget(ctx, u, client, time.Duration(*timeout)*time.Second, *renderJS, time.Duration(*renderWaitMs)*time.Millisecond, xssPayload)
+				cancel()
+				results <- res
+			}
+		}(i)
+	}
+
+	// enqueue jobs
+	go func() {
+		for _, t := range targets {
+			jobs <- t
+		}
+		close(jobs)
+	}()
+
+	// wait for workers to finish then close results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Print results as they arrive (keeps each target's output grouped)
+	for r := range results {
+		fmt.Println(r)
+	}
+}
+
+// scanTarget performs the same checks as before but returns a grouped string
+// It accepts a context so operations can be canceled on timeout.
+func scanTarget(ctx context.Context, target string, client *http.Client, timeout time.Duration, renderJS bool, renderWait time.Duration, xssPayload string) string {
+	var b strings.Builder
+	fmtF := func(format string, a ...interface{}) { fmt.Fprintf(&b, format, a...) }
+
+	fmtF("Scanning target: %s\n", target)
+	// Use context-aware requests so they cancel when ctx is done
+	req, _ := http.NewRequestWithContext(ctx, "GET", target, nil)
+	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Error connecting to target: %v\n", err)
-		os.Exit(1)
+		fmtF("Error connecting to target: %v\n", err)
+		return b.String()
 	}
 	defer resp.Body.Close()
+	fmtF("Received HTTP %d from %s\n", resp.StatusCode, target)
 
-	fmt.Printf("Received HTTP %d from %s\n", resp.StatusCode, *target)
-
-	// XSS Check: inject payload into query param and check reflection
-	xssPayload := "<script>alert('xss')</script>"
-	parsedUrl, err := url.Parse(*target)
+	parsedUrl, err := url.Parse(target)
 	if err != nil {
-		fmt.Printf("Invalid URL: %v\n", err)
-		os.Exit(1)
+		fmtF("Invalid URL: %v\n", err)
+		return b.String()
 	}
 
-	// Add or replace a query parameter for XSS testing
 	q := parsedUrl.Query()
 	testParam := "xss_test"
 	q.Set(testParam, xssPayload)
 	parsedUrl.RawQuery = q.Encode()
 
-	fmt.Printf("Testing for reflected XSS with payload: %s\n", xssPayload)
-	resp, err = client.Get(parsedUrl.String())
+	fmtF("Testing for reflected XSS with payload: %s\n", xssPayload)
+	testReq, _ := http.NewRequestWithContext(ctx, "GET", parsedUrl.String(), nil)
+	testResp, err := client.Do(testReq)
 	if err != nil {
-		fmt.Printf("Error during XSS test: %v\n", err)
-		return
+		fmtF("Error during XSS test: %v\n", err)
+		return b.String()
 	}
-	defer resp.Body.Close()
+	defer testResp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(testResp.Body)
 	if err != nil {
-		fmt.Printf("Error reading response body: %v\n", err)
-		return
+		fmtF("Error reading response body: %v\n", err)
+		return b.String()
 	}
 
-	// Check if the payload is reflected in the response, using local Go server for testing
-	fmt.Printf("Response body length: %d\n", len(body))
-	fmt.Printf("Looking for payload: %s\n", xssPayload)
-	fmt.Printf("Payload found: %v\n", strings.Contains(string(body), xssPayload))
-
-	if strings.Contains(string(body), xssPayload) {
-		fmt.Printf("[!] Potential reflected XSS vulnerability detected! Payload found in response.\n")
+	fmtF("Response body length: %d\n", len(body))
+	fmtF("Looking for payload: %s\n", xssPayload)
+	found := strings.Contains(string(body), xssPayload)
+	fmtF("Payload found: %v\n", found)
+	if found {
+		fmtF("[!] Potential reflected XSS vulnerability detected! Payload found in response.\n")
 	} else {
-		fmt.Printf("[+] No reflected XSS detected with basic payload.\n")
+		fmtF("[+] No reflected XSS detected with basic payload.\n")
 	}
 
-	// Form-based XSS check
-	fmt.Println("\nScanning forms for XSS...")
+	// Form scanning
+	fmtF("\nScanning forms for XSS...\n")
 	htmlForFormScan := string(body)
-	if *renderJS {
-		waitDuration := time.Duration(*renderWaitMs) * time.Millisecond
-		fmt.Printf("JavaScript rendering enabled; loading page in headless browser (wait=%s)...\n", waitDuration)
-		renderedHTML, renderErr := fetchRenderedHTML(*target, time.Duration(*timeout)*time.Second, waitDuration)
+	if renderJS {
+		fmtF("JavaScript rendering enabled; loading page in headless browser (wait=%s)...\n", renderWait)
+		renderedHTML, renderErr := fetchRenderedHTML(ctx, target, timeout, renderWait)
 		if renderErr != nil {
-			fmt.Printf("Warning: could not render JavaScript page (%v). Falling back to raw HTML response.\n", renderErr)
+			fmtF("Warning: could not render JavaScript page (%v). Falling back to raw HTML response.\n", renderErr)
 		} else {
 			htmlForFormScan = renderedHTML
-			fmt.Printf("Rendered DOM length: %d\n", len(htmlForFormScan))
+			fmtF("Rendered DOM length: %d\n", len(htmlForFormScan))
 		}
 	}
 
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlForFormScan))
 	if err != nil {
-		fmt.Printf("Error parsing HTML for forms: %v\n", err)
-		return
+		fmtF("Error parsing HTML for forms: %v\n", err)
+		return b.String()
 	}
 
 	foundForm := false
@@ -140,9 +200,9 @@ func main() {
 		action, exists := s.Attr("action")
 		method, _ := s.Attr("method")
 		if !exists || action == "" {
-			action = *target
+			action = target
 		} else if !strings.HasPrefix(action, "http") {
-			base, _ := url.Parse(*target)
+			base, _ := url.Parse(target)
 			rel, _ := url.Parse(action)
 			action = base.ResolveReference(rel).String()
 		}
@@ -159,32 +219,37 @@ func main() {
 			}
 		})
 
-		fmt.Printf("Testing form %d at %s with method %s\n", i+1, action, method)
+		fmtF("Testing form %d at %s with method %s\n", i+1, action, method)
 		var formResp *http.Response
 		if method == "POST" {
-			formResp, err = client.Post(action, "application/x-www-form-urlencoded", strings.NewReader(formData.Encode()))
+			postReq, _ := http.NewRequestWithContext(ctx, "POST", action, strings.NewReader(formData.Encode()))
+			postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			formResp, err = client.Do(postReq)
 		} else {
 			formURL, _ := url.Parse(action)
 			formURL.RawQuery = formData.Encode()
-			formResp, err = client.Get(formURL.String())
+			getReq, _ := http.NewRequestWithContext(ctx, "GET", formURL.String(), nil)
+			formResp, err = client.Do(getReq)
 		}
 		if err != nil {
-			fmt.Printf("Error submitting form: %v\n", err)
+			fmtF("Error submitting form: %v\n", err)
 			return
 		}
 		defer formResp.Body.Close()
 		formBody, err := io.ReadAll(formResp.Body)
 		if err != nil {
-			fmt.Printf("Error reading form response: %v\n", err)
+			fmtF("Error reading form response: %v\n", err)
 			return
 		}
 		if strings.Contains(string(formBody), xssPayload) {
-			fmt.Printf("[!] Potential reflected XSS in form %d at %s!\n", i+1, action)
+			fmtF("[!] Potential reflected XSS in form %d at %s!\n", i+1, action)
 		} else {
-			fmt.Printf("[+] No reflected XSS detected in form %d.\n", i+1)
+			fmtF("[+] No reflected XSS detected in form %d.\n", i+1)
 		}
 	})
 	if !foundForm {
-		fmt.Println("No forms found on the page.")
+		fmtF("No forms found on the page.\n")
 	}
+
+	return b.String()
 }

@@ -1,83 +1,97 @@
-# XSS Test Scanner
+# GOScan-XSS — Concurrent Headless Reflected XSS Auditor
 
-Small Go-based reflected XSS tester for URL query params and HTML forms.
+Purpose-built for fast, pragmatic reconnaissance of reflected XSS in web applications. GOScan-XSS combines concurrent HTTP probing with an optional headless Chromium renderer to locate and validate reflected payloads in both static and JavaScript-driven pages.
+
+## Why this tool
+
+- Lightweight and focused: designed for quick assessments during pentests or CI-assisted smoke checks.
+- Dual-mode scanning: raw HTTP parsing for speed, and optional headless rendering for JS-heavy apps.
+- Safe by default: non-destructive, uses a single, non-exploitive test payload to detect reflections.
 
 ## Prerequisites
 
-- Go installed (project uses modules)
-- For JS-rendered form scanning (`-js`): Chrome or Chromium installed locally
+- Go (modules-enabled)
+- For JS rendering: Chrome or Chromium accessible on the host
 
-## Install Dependencies
+## Install
+
+Run dependency resolution:
 
 ```bash
 go mod tidy
 ```
 
-## Run: Normal Scan (no JS rendering)
+## Usage
 
-Scan a target URL using plain HTTP response parsing:
+Normal (fast) scan — no JS rendering:
 
 ```bash
 go run . -url="https://example.com/sign-in"
 ```
 
-Optional timeout (seconds):
+Set a custom request timeout (seconds):
 
 ```bash
 go run . -url="https://example.com/sign-in" -timeout=15
 ```
 
-## Run: Chrome Headless Scan (JS-rendered pages)
-
-Use headless browser rendering to detect forms injected by JavaScript:
+Headless Chromium (JS-rendered pages):
 
 ```bash
 go run . -url="https://example.com/sign-in" -js
 ```
 
-Add extra wait time after page load (milliseconds):
+Increase post-load wait (milliseconds) when content is rendered asynchronously:
 
 ```bash
 go run . -url="https://example.com/sign-in" -js -js-wait=3000
 ```
 
-Useful when forms appear after async rendering/hydration.
-
-## Local Demo with Built-in Test Server
-
-Start vulnerable local server and scan it:
+Local demo (built-in vulnerable test server):
 
 ```bash
 go run . -testserver
 ```
 
-With headless JS mode:
+Demo with headless rendering:
 
 ```bash
 go run . -testserver -js -js-wait=2500
 ```
 
-## Expected Outcomes
+## Interpreting results
 
-After a scan, these are the main results to look for:
-
-- `Received HTTP 200 ...` means the target was reachable.
-- `[!] Potential reflected XSS vulnerability detected!` means the test payload was reflected in the response body.
-- `[+] No reflected XSS detected with basic payload.` means this payload was not reflected.
-- `Testing form N at ...` means at least one form was found and submitted for testing.
-- `[!] Potential reflected XSS in form N ...` means a submitted form response reflected the payload.
-- `[+] No reflected XSS detected in form N.` means that tested form did not reflect this payload.
-- `No forms found on the page.` means no `<form>` elements were present in the parsed HTML (common on JS-heavy pages without `-js`, or if content loads after the wait window).
+- `Received HTTP 200 ...`: target reachable and returned content.
+- `[!] Potential reflected XSS vulnerability detected!`: the scanner's probe was reflected in the response body — warrants manual verification.
+- `[+] No reflected XSS detected with basic payload.`: basic reflection not observed; not a guarantee of safety.
+- `Testing form N at ...`: a form was discovered and submitted for testing.
+- `[!] Potential reflected XSS in form N ...`: form submission produced a reflected payload — investigate further.
+- `[+] No reflected XSS detected in form N.`: form did not reflect the test payload.
+- `No forms found on the page.`: no `<form>` elements parsed (may be JS-only content; use `-js` for rendered DOM).
 
 In `-js` mode:
 
-- `JavaScript rendering enabled...` confirms headless rendering path is active.
-- `Rendered DOM length: ...` confirms rendered HTML was captured.
-- `Warning: could not render JavaScript page (...)` means headless rendering failed and scanner fell back to raw HTML.
+- `JavaScript rendering enabled...`: the headless path is active.
+- `Rendered DOM length: ...`: rendered DOM captured for analysis.
+- `Warning: could not render JavaScript page (...)`: headless rendering failed and scanner fell back to raw HTML.
 
-Important: this scanner uses a basic payload and reflection checks, so a negative result is not proof the target is fully XSS-safe.
+## Limitations & guidance
 
-## Notes
+- This is a focused reflected XSS detector that uses a basic, non-destructive payload and simple reflection heuristics. It is intentionally conservative — use it as an initial triage tool, not a comprehensive proof-of-concept generator.
+- A negative result is not definitive. Follow up with manual validation, contextual payload tuning, and a review of client-side behavior.
+- If you need more aggressive testing (DOM-based XSS, stored payloads, context-aware payload generation), integrate this tool into a broader testing workflow or extend it to support additional payloads and context analysis.
 
-- If `-js` mode cannot start Chrome/Chromium, scanner falls back to raw HTML response parsing.
-- This tool is a basic reflected XSS checker and can miss complex client-side/server-side behaviours.
+## Contributing / Extending
+
+- Add new payloads or context-aware checks to enhance coverage.
+- Consider adding a CI-friendly flag to produce machine-readable output (JSON) for automated triage.
+
+---
+
+If you'd like, I can also:
+
+- Add example JSON output for CI integration
+- Expand the demo server with more test cases
+- Add a short CONTRIBUTING section and a CLI `--format json` option
+
+Pull requests and improvements welcome.
